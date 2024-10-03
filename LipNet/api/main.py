@@ -18,10 +18,14 @@ async def predict_video(file: UploadFile = File(...)):
 
         # Call the predict function with the correct paths for the weights and video
         weight_path = "evaluation/models/overlapped-weights368.h5"
-        video, result = predict(weight_path, file_location, 32, 28)  # Adjust args if needed
+        response = predict(weight_path, file_location, 32, 28)  # Adjust args if needed
 
-        # Return only the decoded result (as string)
-        return {"result": result}
+        # The `response` will include both "decoded_text" and "timestamps"
+        decoded_text = response.get("decoded_text", "")
+        timestamps = response.get("timestamps", [])
+
+        # Return both the decoded text and timestamps as the result
+        return {"decoded_text": decoded_text, "timestamps": timestamps}
 
     except Exception as e:
         return {"error": str(e)}
