@@ -12,14 +12,11 @@ class VideoAugmenter(object):
     def split_words(video, align):
         video_aligns = []
         for sub in align.align:
-            # Create new video
             _video = Video(video.vtype, video.face_predictor_path)
             _video.face = video.face[sub[0]:sub[1]]
             _video.mouth = video.mouth[sub[0]:sub[1]]
             _video.set_data(_video.mouth)
-            # Create new align
-            _align = Align(align.absolute_max_string_len, align.label_func).from_array([(0, sub[1]-sub[0], sub[2])])
-            # Append
+            _align = Align(align.absolute_max_string_len, align.label_func).from_array([(0, sub[1] - sub[0], sub[2])])
             video_aligns.append((_video, _align))
         return video_aligns
 
@@ -36,23 +33,12 @@ class VideoAugmenter(object):
             video.face = np.concatenate((video.face, _video.face), 0)
             video.mouth = np.concatenate((video.mouth, _video.mouth), 0)
             for sub in _align.align:
-                _sub = (sub[0]+inc, sub[1]+inc, sub[2])
+                _sub = (sub[0] + inc, sub[1] + inc, sub[2])
                 align.append(_sub)
             inc = align[-1][1]
         video.set_data(video.mouth)
         align = Align(asample.absolute_max_string_len, asample.label_func).from_array(align)
         return (video, align)
-
-    @staticmethod
-    def pick_subsentence(video, align, length):
-        split = VideoAugmenter.split_words(video, align)
-        start = np.random.randint(0, align.word_length - length)
-        return VideoAugmenter.merge(split[start:start+length])
-
-    @staticmethod
-    def pick_word(video, align):
-        video_aligns = np.array(VideoAugmenter.split_words(video, align))
-        return video_aligns[np.random.randint(video_aligns.shape[0], size=2), :][0]
 
     @staticmethod
     def horizontal_flip(video):
@@ -62,51 +48,11 @@ class VideoAugmenter(object):
         _video.set_data(_video.mouth)
         return _video
 
-    @staticmethod
-    def temporal_jitter(video, probability):
-        changes = [] # [(frame_i, type=del/dup)]
-        t = video.length
-        for i in range(t):
-            if np.random.ranf() <= probability/2:
-                changes.append((i, 'del'))
-            if probability/2 < np.random.ranf() <= probability:
-                changes.append((i, 'dup'))
-        _face = np.copy(video.face)
-        _mouth = np.copy(video.mouth)
-        j = 0
-        for change in changes:
-            _change = change[0] + j
-            if change[1] == 'dup':
-                _face = np.insert(_face, _change, _face[_change], 0)
-                _mouth = np.insert(_mouth, _change, _mouth[_change], 0)
-                j = j + 1
-            else:
-                _face = np.delete(_face, _change, 0)
-                _mouth = np.delete(_mouth, _change, 0)
-                j = j - 1
-        _video = Video(video.vtype, video.face_predictor_path)
-        _video.face = _face
-        _video.mouth = _mouth
-        _video.set_data(_video.mouth)
-        return _video
-
-    @staticmethod
-    def pad(video, length):
-        pad_length = max(length - video.length, 0)
-        video_length = min(length, video.length)
-        face_padding = np.ones((pad_length, video.face.shape[1], video.face.shape[2], video.face.shape[3]), dtype=np.uint8) * 0
-        mouth_padding = np.ones((pad_length, video.mouth.shape[1], video.mouth.shape[2], video.mouth.shape[3]), dtype=np.uint8) * 0
-        _video = Video(video.vtype, video.face_predictor_path)
-        _video.face = np.concatenate((video.face[0:video_length], face_padding), 0)
-        _video.mouth = np.concatenate((video.mouth[0:video_length], mouth_padding), 0)
-        _video.set_data(_video.mouth)
-        return _video
-
 
 class Video(object):
     def __init__(self, vtype='mouth', face_predictor_path=None):
         if vtype == 'face' and face_predictor_path is None:
-            raise AttributeError('Face video need to be accompanied with face predictor')
+            raise AttributeError('Face video requires a face predictor path.')
         self.face_predictor_path = face_predictor_path
         self.vtype = vtype
 
@@ -118,6 +64,7 @@ class Video(object):
 
     def from_video(self, path):
         frames = self.get_video_frames(path)
+        print(f"Total frames extracted from video: {len(frames)}")  # Debugging statement
         self.handle_type(frames)
         return self
 
@@ -131,7 +78,7 @@ class Video(object):
         elif self.vtype == 'face':
             self.process_frames_face(frames)
         else:
-            raise Exception('Video type not found')
+            raise Exception('Invalid video type.')
 
     def process_frames_face(self, frames):
         detector = dlib.get_frontal_face_detector()
@@ -152,33 +99,32 @@ class Video(object):
         HORIZONTAL_PAD = 0.19
         normalize_ratio = None
         mouth_frames = []
-        for frame in frames:
+        frame_count = 0  # Track frame index
+
+        for idx, frame in enumerate(frames):
             dets = detector(frame, 1)
             shape = None
             for k, d in enumerate(dets):
                 shape = predictor(frame, d)
-                i = -1
-            if shape is None: # Detector doesn't detect face, just return as is
-                return frames
-            mouth_points = []
-            for part in shape.parts():
-                i += 1
-                if i < 48: # Only take mouth region
-                    continue
-                mouth_points.append((part.x,part.y))
-            np_mouth_points = np.array(mouth_points)
+                break  # Only process the first detected face
 
-            mouth_centroid = np.mean(np_mouth_points[:, -2:], axis=0)
+            if shape is None:
+                print(f"Warning: Face not detected in frame {idx}")
+                # Instead of returning immediately, append a black frame or the original frame
+                # For simplicity, we'll append the original frame resized to the mouth dimensions
+                mouth_frames.append(imresize(frame, (MOUTH_HEIGHT, MOUTH_WIDTH)))
+                continue
+
+            mouth_points = [(part.x, part.y) for i, part in enumerate(shape.parts()) if i >= 48]
+            np_mouth_points = np.array(mouth_points)
+            mouth_centroid = np.mean(np_mouth_points, axis=0)
 
             if normalize_ratio is None:
-                mouth_left = np.min(np_mouth_points[:, :-1]) * (1.0 - HORIZONTAL_PAD)
-                mouth_right = np.max(np_mouth_points[:, :-1]) * (1.0 + HORIZONTAL_PAD)
-
+                mouth_left = np.min(np_mouth_points[:, 0]) * (1.0 - HORIZONTAL_PAD)
+                mouth_right = np.max(np_mouth_points[:, 0]) * (1.0 + HORIZONTAL_PAD)
                 normalize_ratio = MOUTH_WIDTH / float(mouth_right - mouth_left)
 
-            new_img_shape = (int(frame.shape[0] * normalize_ratio), int(frame.shape[1] * normalize_ratio))
-            resized_img = imresize(frame, new_img_shape)
-
+            resized_img = imresize(frame, (int(frame.shape[0] * normalize_ratio), int(frame.shape[1] * normalize_ratio)))
             mouth_centroid_norm = mouth_centroid * normalize_ratio
 
             mouth_l = int(mouth_centroid_norm[0] - MOUTH_WIDTH / 2)
@@ -187,25 +133,32 @@ class Video(object):
             mouth_b = int(mouth_centroid_norm[1] + MOUTH_HEIGHT / 2)
 
             mouth_crop_image = resized_img[mouth_t:mouth_b, mouth_l:mouth_r]
-
             mouth_frames.append(mouth_crop_image)
+            frame_count += 1
+
+        print(f"Total frames processed for mouth detection: {len(mouth_frames)}")  # Debugging statement
         return mouth_frames
 
     def get_video_frames(self, path):
         videogen = skvideo.io.vreader(path)
-        frames = np.array([frame for frame in videogen])
+        frames = [frame for frame in videogen]
+        print(f"Total frames extracted: {len(frames)}")  # Debugging statement
         return frames
 
     def set_data(self, frames):
         data_frames = []
-        for frame in frames:
-            frame = frame.swapaxes(0,1) # swap width and height to form format W x H x C
+        for idx, frame in enumerate(frames):
+            frame = frame.swapaxes(0, 1)  # Swap width and height to form format W x H x C
             if len(frame.shape) < 3:
-                frame = np.array([frame]).swapaxes(0,2).swapaxes(0,1) # Add grayscale channel
+                frame = np.expand_dims(frame, axis=-1)
             data_frames.append(frame)
+            # print(f"Processed frame {idx}: shape {frame.shape}")  # Optional debugging
+
         frames_n = len(data_frames)
-        data_frames = np.array(data_frames) # T x W x H x C
+        data_frames = np.array(data_frames)  # T x W x H x C
         if K.image_data_format() == 'channels_first':
-            data_frames = np.rollaxis(data_frames, 3) # C x T x W x H
+            data_frames = np.rollaxis(data_frames, 3)  # C x T x W x H
+
         self.data = data_frames
         self.length = frames_n
+        print(f"Total frames processed into data: {self.length}")  # Debugging statement

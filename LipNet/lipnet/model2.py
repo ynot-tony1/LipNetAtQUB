@@ -19,7 +19,7 @@ class LipNet(object):
         self.frames_n = frames_n
         self.absolute_max_string_len = absolute_max_string_len
         self.output_size = output_size
-        self.build()
+        # self.build()  # <-- Comment out or remove this line
 
     def build(self):
         print("Building the LipNet model...")
