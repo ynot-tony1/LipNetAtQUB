@@ -1,19 +1,30 @@
-from lipnet.lipreading.videos import Video
+import os
+import sys
+import subprocess
+import logging
+import cv2
+import dlib
+import numpy as np
+
+from lipnet.lipreading.videos import Video 
 from lipnet.lipreading.helpers import labels_to_text
 from lipnet.utils.spell import Spell
 from lipnet.model2 import LipNet
+
 from keras.optimizers import Adam
 from keras.models import Model
 from keras import backend as K
-import numpy as np
-import sys
-import os
-import cv2
-import dlib
-import subprocess
 
+# Suppress TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppresses INFO and WARNING messages
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s: %(message)s')
+
+# Set random seed for reproducibility
 np.random.seed(55)
 
+# Define paths
 CURRENT_PATH = os.path.dirname(os.path.abspath(__file__))
 FACE_PREDICTOR_PATH = os.path.join(
     CURRENT_PATH, '..', 'common', 'predictors', 'shape_predictor_68_face_landmarks.dat')
@@ -40,18 +51,21 @@ def detect_speech_onset(video_path, start_time=START_TIME, movement_threshold=30
     predictor = dlib.shape_predictor(FACE_PREDICTOR_PATH)
 
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logging.error("Failed to open video for speech onset detection.")
+        return start_time  # Default to start_time if video cannot be read
+
     fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = 1
+    speech_onset_frame = None
 
     ret, prev_frame = cap.read()
     if not ret:
         cap.release()
-        return 0.0  # Default to 0 if video cannot be read
+        logging.error("Failed to read the first frame of the video.")
+        return start_time  # Default to 0 if video cannot be read
 
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-
-    frame_count = 1
-    mouth_movement = []
-    speech_onset_frame = None
 
     while True:
         ret, frame = cap.read()
@@ -82,7 +96,6 @@ def detect_speech_onset(video_path, start_time=START_TIME, movement_threshold=30
             mouth_diff = cv2.absdiff(prev_gray, gray)
             mouth_diff = cv2.bitwise_and(mouth_diff, mouth_diff, mask=mask)
             movement = np.sum(mouth_diff)
-            mouth_movement.append(movement)
 
             # Log movement per frame
             print(f"Frame {frame_count}: Movement={movement}")
@@ -99,42 +112,91 @@ def detect_speech_onset(video_path, start_time=START_TIME, movement_threshold=30
 
     if speech_onset_frame is not None:
         # Calculate speech onset time without adding start_time
-        speech_onset_time = speech_onset_frame / fps + start_time
+        speech_onset_time = (speech_onset_frame / fps) + start_time
     else:
         speech_onset_time = start_time  # Default to start_time if speech onset not detected
+        logging.warning("Speech onset not detected. Using start_time as speech_onset_time.")
 
     print(f"Speech onset detected at frame {speech_onset_frame}, time {speech_onset_time:.2f}s")
     return speech_onset_time
 
-def get_video_duration(video_path):
+def get_video_metadata(video_path):
     """
-    Use ffprobe to get the start_time and duration of the video.
+    Extracts video metadata using ffprobe.
+
+    Parameters:
+    - video_path (str): Path to the video file.
+
+    Returns:
+    - metadata (dict): Dictionary containing video metadata.
     """
     cmd = [
         'ffprobe',
         '-v', 'error',
         '-select_streams', 'v:0',
-        '-show_entries', 'format=start_time,duration',
+        '-count_frames',  # Correct usage
+        '-show_entries', 'format=start_time,duration,nb_read_frames,avg_frame_rate',
         '-of', 'default=noprint_wrappers=1:nokey=1',
         video_path
     ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    output = result.stdout.strip().split('\n')
-    if len(output) >= 2:
-        try:
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        output = result.stdout.strip().split('\n')
+        if len(output) >= 4:
             start_time = float(output[0])
             duration = float(output[1])
-            return start_time, duration
-        except ValueError:
-            pass
-    # Fallback if ffprobe fails
+            nb_frames = int(output[2])  # 'nb_read_frames' from ffprobe
+            avg_frame_rate = output[3]
+            # Calculate FPS from avg_frame_rate
+            if '/' in avg_frame_rate:
+                num, denom = avg_frame_rate.split('/')
+                fps = float(num) / float(denom) if float(denom) != 0 else 25.0  # Default to 25 if denom is 0
+            else:
+                fps = float(avg_frame_rate) if avg_frame_rate else 25.0
+            metadata = {
+                'start_time': start_time,
+                'duration': duration,
+                'nb_frames': nb_frames,
+                'fps': fps
+            }
+            return metadata
+        else:
+            logging.warning("ffprobe output incomplete. Falling back to OpenCV.")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"ffprobe error: {e.stderr}")
+    except Exception as e:
+        logging.error(f"Unexpected error while running ffprobe: {e}")
+    
+    # Fallback using OpenCV if ffprobe fails
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logging.error("Failed to open video with OpenCV.")
+        return None
     fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = frame_count / fps if fps else 0
     cap.release()
-    return START_TIME, frame_count / fps  # Use predefined START_TIME
+    metadata = {
+        'start_time': 0.0,  # Assume 0 if ffprobe fails
+        'duration': duration,
+        'nb_frames': frame_count,
+        'fps': fps
+    }
+    return metadata
 
 def predict(weight_path, video_path, absolute_max_string_len=32, output_size=28):
+    """
+    Performs lip-reading prediction on the given video using the LipNet model.
+
+    Parameters:
+    - weight_path (str): Path to the model weights file.
+    - video_path (str): Path to the video file.
+    - absolute_max_string_len (int): Maximum length of the predicted string.
+    - output_size (int): Number of output classes.
+
+    Returns:
+    - dict: Contains decoded text and word timestamps.
+    """
     # Ensure parameters are integers
     absolute_max_string_len = int(absolute_max_string_len)
     output_size = int(output_size)
@@ -175,6 +237,7 @@ def predict(weight_path, video_path, absolute_max_string_len=32, output_size=28)
         print("Error: Speech onset time exceeds video duration.")
         return None
 
+    # Determine image data format
     if K.image_data_format() == 'channels_first':
         img_c, frames_n, img_w, img_h = video.data.shape
     else:
@@ -267,6 +330,21 @@ def predict(weight_path, video_path, absolute_max_string_len=32, output_size=28)
         label_seq.append({'char': char, 'time': adjusted_time})
         prev_label = label
 
+    # **Alignment Adjustment Starts Here**
+    # To align the first word's start time with speech_onset_time,
+    # determine the delay introduced by skipped labels (e.g., blank labels)
+    # Assume a fixed delay of 2 time steps (as observed)
+    delay_steps = 2  # Number of time steps skipped
+    adjusted_speech_onset_time = speech_onset_time - (delay_steps * time_per_step)
+
+    # Ensure that the adjusted_speech_onset_time is not negative
+    if adjusted_speech_onset_time < start_time:
+        adjusted_speech_onset_time = start_time
+
+    # Recalculate adjusted_time with the new speech_onset_time
+    for item in label_seq:
+        item['time'] = (item['time'] - speech_onset_time) + adjusted_speech_onset_time
+
     # Group characters into words
     words = []
     current_word = ''
@@ -311,79 +389,6 @@ def predict(weight_path, video_path, absolute_max_string_len=32, output_size=28)
         print(f"Word: {w['word']}, Start Time: {w['start_time']:.2f}s")
 
     return {'decoded_text': corrected_text, 'timestamps': words}
-
-
-
-import subprocess
-import logging
-import cv2
-
-def get_video_metadata(video_path):
-    """
-    Extracts video metadata using ffprobe.
-
-    Parameters:
-    - video_path (str): Path to the video file.
-
-    Returns:
-    - metadata (dict): Dictionary containing video metadata.
-    """
-    cmd = [
-        'ffprobe',
-        '-v', 'error',
-        '-select_streams', 'v:0',
-        '-count_frames',  # Correct usage
-        '-show_entries', 'format=start_time,duration,nb_read_frames,avg_frame_rate',
-        '-of', 'default=noprint_wrappers=1:nokey=1',
-        video_path
-    ]
-    try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        output = result.stdout.strip().split('\n')
-        if len(output) >= 4:
-            start_time = float(output[0])
-            duration = float(output[1])
-            nb_frames = int(output[2])  # 'nb_read_frames' from ffprobe
-            avg_frame_rate = output[3]
-            # Calculate FPS from avg_frame_rate
-            if '/' in avg_frame_rate:
-                num, denom = avg_frame_rate.split('/')
-                fps = float(num) / float(denom) if float(denom) != 0 else 25.0  # Default to 25 if denom is 0
-            else:
-                fps = float(avg_frame_rate) if avg_frame_rate else 25.0
-            metadata = {
-                'start_time': start_time,
-                'duration': duration,
-                'nb_frames': nb_frames,
-                'fps': fps
-            }
-            return metadata
-        else:
-            logging.warning("ffprobe output incomplete. Falling back to OpenCV.")
-    except subprocess.CalledProcessError as e:
-        logging.error(f"ffprobe error: {e.stderr}")
-    except Exception as e:
-        logging.error(f"Unexpected error while running ffprobe: {e}")
-    
-    # Fallback using OpenCV if ffprobe fails
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        logging.error("Failed to open video with OpenCV.")
-        return None
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = frame_count / fps if fps else 0
-    cap.release()
-    metadata = {
-        'start_time': 0.0,  # Assume 0 if ffprobe fails
-        'duration': duration,
-        'nb_frames': frame_count,
-        'fps': fps
-    }
-    return metadata
-
-
-
 
 if __name__ == '__main__':
     if len(sys.argv) >= 3:
